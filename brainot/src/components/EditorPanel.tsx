@@ -564,7 +564,7 @@ const EditorPanel: React.FC<EditorPanelProps> = ({ user, event, selectedDate, on
 
       {/* Modern Editor */}
       <div className="flex-1 flex flex-col p-6 space-y-6">
-        <style jsx>{`
+        <style dangerouslySetInnerHTML={{__html: `
           @keyframes slideInUp {
             from {
               opacity: 0;
@@ -575,7 +575,7 @@ const EditorPanel: React.FC<EditorPanelProps> = ({ user, event, selectedDate, on
               transform: translateY(0) scale(1);
             }
           }
-        `}</style>
+        `}} />
         {/* Title Input */}
         <div className="space-y-2">
           <input

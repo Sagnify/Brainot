@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { signOut } from 'firebase/auth';
 import { auth } from '../firebase';
 import { User } from '../types';
-import { workingGoogleCalendarService } from '../services/workingGoogleCalendar';
+import { googleCalendarService } from '../services/googleCalendarService';
 import toast from 'react-hot-toast';
 
 interface HeaderProps {
@@ -38,10 +38,10 @@ const Header: React.FC<HeaderProps> = ({ user, onSyncCalendar }) => {
     console.log('=== Working Google Calendar Sync Started ===');
     setIsSyncing(true);
     try {
-      if (!workingGoogleCalendarService.isAuthenticated()) {
-        console.log('1. Not authenticated, starting OAuth flow...');
-        await workingGoogleCalendarService.authenticate();
-        console.log('2. Authentication successful');
+      // Check if user has Google Calendar access token
+      const hasToken = localStorage.getItem('googleAccessToken');
+      if (!hasToken) {
+        throw new Error('Google Calendar not connected');
       }
       
       if (onSyncCalendar) {
