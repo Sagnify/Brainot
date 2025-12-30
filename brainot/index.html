@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="BrainNot - Modern calendar-based notebook application">
+    <title>BrainNot - Smart Calendar Notes</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="font-sans antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/index.tsx"></script>
+    
+    <!-- Google OAuth redirect handler -->
+    <script>
+      // Handle OAuth redirect in popup
+      if (window.location.hash && window.location.hash.includes('access_token')) {
+        const params = new URLSearchParams(window.location.hash.substring(1));
+        const accessToken = params.get('access_token');
+        const error = params.get('error');
+        
+        if (accessToken) {
+          window.opener?.postMessage({
+            type: 'GOOGLE_AUTH_SUCCESS',
+            token: accessToken
+          }, window.location.origin);
+        } else if (error) {
+          window.opener?.postMessage({
+            type: 'GOOGLE_AUTH_ERROR',
+            error: error
+          }, window.location.origin);
+        }
+        
+        window.close();
+      }
+    </script>
+</body>
+</html>
