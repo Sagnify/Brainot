@@ -1,13 +1,94 @@
-import { auth } from '../firebase';
+import { auth, googleProvider } from '../firebase';
+import { signInWithPopup, GoogleAuthProvider } from 'firebase/auth';
 import { MyEvent } from '../types';
 
 class GoogleCalendarService {
-  private async getAccessToken(): Promise<string> {
-    const user = auth.currentUser;
-    if (!user) throw new Error('User not authenticated');
+  private async ensureValidToken(): Promise<boolean> {
+    try {
+      let token = localStorage.getItem('googleAccessToken');
+      const refreshToken = localStorage.getItem('googleRefreshToken');
+      
+      if (!token && !refreshToken) {
+        // No tokens at all, need fresh auth
+        return await this.requestNewTokens();
+      }
+      
+      if (token) {
+        // Test if current token is valid
+        const testResponse = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary', {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        
+        if (testResponse.ok) {
+          return true;
+        }
+      }
+      
+      // Token invalid/expired, try refresh
+      if (refreshToken) {
+        return await this.refreshAccessToken(refreshToken);
+      }
+      
+      // No refresh token, need fresh auth
+      return await this.requestNewTokens();
+    } catch (error) {
+      console.error('Token validation failed:', error);
+      return false;
+    }
+  }
+  
+  private async refreshAccessToken(refreshToken: string): Promise<boolean> {
+    try {
+      const response = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: import.meta.env.VITE_FIREBASE_API_KEY,
+          refresh_token: refreshToken,
+          grant_type: 'refresh_token'
+        })
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        localStorage.setItem('googleAccessToken', data.access_token);
+        console.log('✅ Google token refreshed automatically');
+        return true;
+      }
+    } catch (error) {
+      console.error('Token refresh failed:', error);
+    }
     
-    // Get the stored Google Access Token
-    const token = sessionStorage.getItem('google_access_token');
+    // Refresh failed, clear tokens and request new ones
+    localStorage.removeItem('googleAccessToken');
+    localStorage.removeItem('googleRefreshToken');
+    return await this.requestNewTokens();
+  }
+  
+  private async requestNewTokens(): Promise<boolean> {
+    try {
+      const user = auth.currentUser;
+      if (!user) return false;
+      
+      const result = await signInWithPopup(auth, googleProvider);
+      const credential = GoogleAuthProvider.credentialFromResult(result);
+      
+      if (credential?.accessToken) {
+        localStorage.setItem('googleAccessToken', credential.accessToken);
+        // Note: Firebase doesn't provide refresh tokens directly
+        // In production, you'd implement server-side token management
+        console.log('✅ New Google tokens obtained');
+        return true;
+      }
+    } catch (error) {
+      console.error('New token request failed:', error);
+    }
+    
+    return false;
+  }
+  private async getAccessToken(): Promise<string> {
+    // Check both storage locations
+    let token = localStorage.getItem('googleAccessToken') || sessionStorage.getItem('google_access_token');
     
     if (!token) {
       throw new Error('Google Access Token missing. Please re-login for Calendar sync.');
@@ -30,7 +111,8 @@ class GoogleCalendarService {
 
     if (!response.ok) {
       if (response.status === 401) {
-        // Token expired, clear it
+        // Token expired, clear both storage locations
+        localStorage.removeItem('googleAccessToken');
         sessionStorage.removeItem('google_access_token');
         throw new Error('Google Calendar access expired. Please re-login.');
       }
@@ -99,44 +181,70 @@ class GoogleCalendarService {
   }
 
   async deleteEvent(googleEventId: string): Promise<void> {
-    await this.makeRequest(
-      `https://www.googleapis.com/calendar/v3/calendars/primary/events/${googleEventId}`,
-      {
-        method: 'DELETE'
-      }
-    );
+    if (!(await this.ensureValidToken())) {
+      console.error('❌ Google Calendar delete failed: Not connected');
+      throw new Error('Google Calendar not connected');
+    }
+    try {
+      await this.makeRequest(
+        `https://www.googleapis.com/calendar/v3/calendars/primary/events/${googleEventId}`,
+        {
+          method: 'DELETE'
+        }
+      );
+      console.log('✅ Google Calendar delete successful:', googleEventId);
+    } catch (error) {
+      console.error('❌ Google Calendar delete failed:', error);
+      throw error;
+    }
   }
 
   async updateEvent(event: MyEvent): Promise<void> {
+    if (!(await this.ensureValidToken())) {
+      console.error('❌ Google Calendar update failed: Not connected');
+      throw new Error('Google Calendar not connected');
+    }
     const googleEventId = event.resource?.googleEventId;
-    if (!googleEventId) throw new Error('No Google Event ID found to update');
+    if (!googleEventId) {
+      console.error('❌ Google Calendar update failed: No Google Event ID');
+      throw new Error('No Google Event ID found to update');
+    }
 
-    const googleEvent = this.convertToGoogleEvent(event);
-
-    await this.makeRequest(
-      `https://www.googleapis.com/calendar/v3/calendars/primary/events/${googleEventId}`,
-      {
-        method: 'PATCH',
-        body: JSON.stringify(googleEvent)
-      }
-    );
+    try {
+      const googleEvent = this.convertToGoogleEvent(event);
+      await this.makeRequest(
+        `https://www.googleapis.com/calendar/v3/calendars/primary/events/${googleEventId}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify(googleEvent)
+        }
+      );
+      console.log('✅ Google Calendar update successful:', googleEventId);
+    } catch (error) {
+      console.error('❌ Google Calendar update failed:', error);
+      throw error;
+    }
   }
 
   async syncEvent(event: MyEvent): Promise<string | null> {
+    if (!(await this.ensureValidToken())) {
+      console.error('❌ Google Calendar sync failed: Not connected');
+      throw new Error('Google Calendar not connected');
+    }
     try {
       if (!event.resource?.googleEventId) {
         // Create new event
         const googleEventId = await this.createEvent(event);
-        console.log('Synced to Google Calendar:', googleEventId);
+        console.log('✅ Google Calendar sync successful: Created event', googleEventId);
         return googleEventId;
       } else {
         // Update existing event
         await this.updateEvent(event);
-        console.log('Updated Google Calendar event:', event.resource.googleEventId);
+        console.log('✅ Google Calendar sync successful: Updated event', event.resource.googleEventId);
         return event.resource.googleEventId;
       }
     } catch (error) {
-      console.log('Google Calendar sync skipped:', error);
+      console.error('❌ Google Calendar sync failed:', error);
       return null;
     }
   }

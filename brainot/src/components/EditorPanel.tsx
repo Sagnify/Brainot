@@ -5,6 +5,7 @@ import { db } from '../firebase';
 import { MyEvent, User } from '../types';
 import { googleCalendarService } from '../services/googleCalendarService';
 import { geminiService } from '../services/geminiService';
+import { detectDatesInText, highlightDatesInHTML } from '../utils/dateDetection';
 import toast from 'react-hot-toast';
 import TypeSelector from './TypeSelector';
 
@@ -32,6 +33,12 @@ const EditorPanel: React.FC<EditorPanelProps> = ({ user, event, selectedDate, on
   const [toolbarPosition, setToolbarPosition] = useState({ top: 0, left: 0 });
   const [showAiMenu, setShowAiMenu] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
+  const [showDatePopup, setShowDatePopup] = useState(false);
+  const [selectedDetectedDate, setSelectedDetectedDate] = useState<Date | null>(null);
+  const [popupPosition, setPopupPosition] = useState({ top: 0, left: 0 });
+  const [showEventForm, setShowEventForm] = useState(false);
+  const [eventFormData, setEventFormData] = useState({ title: '', startTime: '09:00', endTime: '10:00' });
+  const debounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isInitializing = useRef(false);
@@ -381,6 +388,119 @@ const EditorPanel: React.FC<EditorPanelProps> = ({ user, event, selectedDate, on
     setShowToolbar(false);
   }, []);
 
+  const handleContentChange = useCallback((newContent: string) => {
+    if (isInitializing.current) return;
+    
+    // Clear existing debounce
+    if (debounceTimeoutRef.current) {
+      clearTimeout(debounceTimeoutRef.current);
+    }
+    
+    // Set content immediately for responsive typing
+    setContent(newContent);
+    
+    // Debounce date detection to avoid cursor issues
+    debounceTimeoutRef.current = setTimeout(() => {
+      const tempDiv = document.createElement('div');
+      tempDiv.innerHTML = newContent;
+      const plainText = tempDiv.innerText || tempDiv.textContent || '';
+      
+      const detectedDates = detectDatesInText(plainText);
+      
+      if (detectedDates.length > 0 && editorRef.current) {
+        const highlightedContent = highlightDatesInHTML(plainText, detectedDates);
+        
+        if (highlightedContent !== plainText) {
+          // Save current selection
+          const selection = window.getSelection();
+          let savedRange: Range | null = null;
+          if (selection && selection.rangeCount > 0) {
+            savedRange = selection.getRangeAt(0).cloneRange();
+          }
+          
+          editorRef.current.innerHTML = highlightedContent;
+          
+          // Restore selection after a brief delay
+          setTimeout(() => {
+            if (editorRef.current) {
+              // Always place cursor at the end of content
+              const range = document.createRange();
+              const sel = window.getSelection();
+              range.selectNodeContents(editorRef.current);
+              range.collapse(false); // false = collapse to end
+              sel?.removeAllRanges();
+              sel?.addRange(range);
+            }
+            
+            // Add click listeners
+            const dateElements = editorRef.current!.querySelectorAll('.detected-date');
+            dateElements.forEach(element => {
+              element.addEventListener('click', (e) => {
+                e.preventDefault();
+                const dateStr = (e.target as HTMLElement).getAttribute('data-date');
+                if (dateStr) {
+                  const date = new Date(dateStr);
+                  const rect = (e.target as HTMLElement).getBoundingClientRect();
+                  setPopupPosition({ top: rect.bottom + 5, left: rect.left });
+                  setSelectedDetectedDate(date);
+                  setShowDatePopup(true);
+                }
+              });
+            });
+          }, 10);
+          
+          setContent(highlightedContent);
+        }
+      }
+    }, 500); // 500ms debounce
+  }, []);
+
+  const handleCreateEventFromDate = useCallback(async () => {
+    if (!selectedDetectedDate || !eventFormData.title.trim()) return;
+    
+    try {
+      const startDateTime = new Date(`${format(selectedDetectedDate, 'yyyy-MM-dd')}T${eventFormData.startTime}`);
+      const endDateTime = new Date(`${format(selectedDetectedDate, 'yyyy-MM-dd')}T${eventFormData.endTime}`);
+      
+      const eventData = {
+        title: eventFormData.title.trim(),
+        start: Timestamp.fromDate(startDateTime),
+        end: Timestamp.fromDate(endDateTime),
+        allDay: false,
+        priority: 'medium' as const
+      };
+      
+      const docRef = await addDoc(collection(db, 'users', user.uid, 'events'), eventData);
+      
+      // Sync with Google Calendar
+      try {
+        const googleEventId = await googleCalendarService.syncEvent({
+          id: docRef.id,
+          title: eventFormData.title.trim(),
+          start: startDateTime,
+          end: endDateTime,
+          allDay: false,
+          resource: { isNote: false, priority: 'medium' }
+        });
+        
+        if (googleEventId) {
+          await updateDoc(docRef, { googleEventId });
+        }
+      } catch (error) {
+        console.log('Google Calendar sync failed:', error);
+      }
+      
+      toast.success('Event created successfully!');
+      setShowEventForm(false);
+      setShowDatePopup(false);
+      setSelectedDetectedDate(null);
+      setEventFormData({ title: '', startTime: '09:00', endTime: '10:00' });
+    } catch (error) {
+      console.error('Error creating event:', error);
+      toast.error('Failed to create event');
+    }
+  }, [selectedDetectedDate, eventFormData, user.uid]);
+
   const handleAiAction = useCallback(async (action: string) => {
     if (!editorRef.current || aiLoading) return;
     
@@ -597,7 +717,7 @@ const EditorPanel: React.FC<EditorPanelProps> = ({ user, event, selectedDate, on
             onInput={(e) => {
               if (!isInitializing.current) {
                 const newContent = e.currentTarget.innerHTML;
-                setContent(newContent);
+                handleContentChange(newContent);
               }
             }}
             onMouseUp={handleTextSelection}
@@ -655,8 +775,145 @@ const EditorPanel: React.FC<EditorPanelProps> = ({ user, event, selectedDate, on
       </div>
 
       {renderInlineToolbar()}
+      {renderDatePopup()}
+      {renderEventForm()}
     </div>
   );
+
+  const renderDatePopup = () => {
+    if (!showDatePopup || !selectedDetectedDate) return null;
+
+    return (
+      <div 
+        className="fixed z-50 bg-white border border-gray-200 rounded-xl shadow-xl p-4 min-w-[250px]"
+        style={{ top: popupPosition.top, left: popupPosition.left }}
+      >
+        <div className="flex items-center space-x-3 mb-3">
+          <div className="w-8 h-8 bg-blue-100 rounded-lg flex items-center justify-center">
+            <svg className="w-4 h-4 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3a2 2 0 012-2h4a2 2 0 012 2v4m-6 4v10a2 2 0 002 2h4a2 2 0 002 2V11M8 7h8" />
+            </svg>
+          </div>
+          <div>
+            <p className="font-medium text-gray-900">Create Event</p>
+            <p className="text-sm text-gray-500">{format(selectedDetectedDate, 'MMM d, yyyy')}</p>
+          </div>
+        </div>
+        
+        <div className="flex space-x-2">
+          <button
+            onClick={() => {
+              setShowDatePopup(false);
+              setSelectedDetectedDate(null);
+            }}
+            className="flex-1 px-3 py-2 text-gray-600 hover:text-gray-800 font-medium transition-colors rounded-lg border border-gray-200 hover:bg-gray-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => {
+              setShowEventForm(true);
+              setEventFormData({ title: '', startTime: '09:00', endTime: '10:00' });
+            }}
+            className="flex-1 px-3 py-2 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition-colors"
+          >
+            Create Event
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  const renderEventForm = () => {
+    if (!showEventForm || !selectedDetectedDate) return null;
+
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div className="bg-white rounded-xl shadow-xl p-6 w-full max-w-md mx-4">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-semibold text-gray-900">Create Event</h3>
+            <button
+              onClick={() => {
+                setShowEventForm(false);
+                setShowDatePopup(false);
+                setSelectedDetectedDate(null);
+              }}
+              className="p-1 hover:bg-gray-100 rounded-lg transition-colors"
+            >
+              <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Event Title</label>
+              <input
+                type="text"
+                value={eventFormData.title}
+                onChange={(e) => setEventFormData(prev => ({ ...prev, title: e.target.value }))}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                placeholder="Enter event title..."
+                autoFocus
+              />
+            </div>
+            
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
+              <input
+                type="text"
+                value={format(selectedDetectedDate, 'MMM d, yyyy')}
+                disabled
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-gray-50 text-gray-600"
+              />
+            </div>
+            
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Start Time</label>
+                <input
+                  type="time"
+                  value={eventFormData.startTime}
+                  onChange={(e) => setEventFormData(prev => ({ ...prev, startTime: e.target.value }))}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">End Time</label>
+                <input
+                  type="time"
+                  value={eventFormData.endTime}
+                  onChange={(e) => setEventFormData(prev => ({ ...prev, endTime: e.target.value }))}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                />
+              </div>
+            </div>
+          </div>
+          
+          <div className="flex space-x-3 mt-6">
+            <button
+              onClick={() => {
+                setShowEventForm(false);
+                setShowDatePopup(false);
+                setSelectedDetectedDate(null);
+              }}
+              className="flex-1 px-4 py-2 text-gray-600 hover:text-gray-800 font-medium transition-colors rounded-lg border border-gray-300 hover:bg-gray-50"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleCreateEventFromDate}
+              disabled={!eventFormData.title.trim()}
+              className="flex-1 px-4 py-2 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              Create Event
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   const renderInlineToolbar = () => {
     if (!showToolbar) return null;
